@@ -107,6 +107,9 @@ type Service struct {
 	initConstants             RepoServerInitConstants
 	// stores cached symlink validation results
 	symlinksState *gocache.Cache
+	// jsonnetReadSetCache is the optional process-local cache of native
+	// Jsonnet render read-sets. It is always present but inert unless enabled.
+	jsonnetReadSetCache *jsonnetReadSetCache
 	// now is usually just time.Now, but may be replaced by unit tests for testing purposes
 	now func() time.Time
 }
@@ -134,6 +137,19 @@ type RepoServerInitConstants struct {
 	GitLsRemoteOptimizedEnabled                  bool
 	HelmUserAgent                                string
 	HelmChartCacheExpiration                     time.Duration // Cache expiration for repo
+	// JsonnetReadSetCacheEnabled opts in to the native Jsonnet read-set cache,
+	// which reuses render output across revisions when the full read-set is
+	// provably unchanged. Disabled by default.
+	JsonnetReadSetCacheEnabled bool
+	// JsonnetReadSetMaxFiles bounds the number of distinct blobs one cached
+	// Jsonnet evaluation may have read. Zero means use the built-in default.
+	JsonnetReadSetMaxFiles int
+	// JsonnetReadSetMaxChecks bounds the number of recorded non-existent
+	// import candidates of one cached evaluation. Zero means default.
+	JsonnetReadSetMaxChecks int
+	// JsonnetReadSetMaxBytes bounds the total bytes of the blobs of one
+	// cached evaluation. Zero means default.
+	JsonnetReadSetMaxBytes int64
 }
 
 var (
@@ -178,6 +194,13 @@ func NewService(metricsServer *metrics.MetricsServer, cache *cache.Cache, initCo
 		gitRepoInitializer: directoryPermissionInitializer,
 		rootDir:            rootDir,
 		symlinksState:      gocache.New(12*time.Hour, time.Hour),
+		jsonnetReadSetCache: newJsonnetReadSetCache(
+			initConstants.JsonnetReadSetCacheEnabled,
+			0, // entry count uses the built-in default
+			initConstants.JsonnetReadSetMaxFiles,
+			initConstants.JsonnetReadSetMaxChecks,
+			initConstants.JsonnetReadSetMaxBytes,
+		),
 	}
 }
 
@@ -993,7 +1016,7 @@ func (s *Service) runManifestGenAsync(ctx context.Context, repoRoot, commitSHA, 
 			}
 		}
 
-		manifestGenResult, err = GenerateManifests(ctx, opContext.appPath, repoRoot, commitSHA, q, false, s.gitCredsStore, s.initConstants.MaxCombinedDirectoryManifestsSize, s.gitRepoPaths, WithCMPTarDoneChannel(ch.tarDoneCh), WithCMPTarExcludedGlobs(s.initConstants.CMPTarExcludedGlobs), WithCMPUseManifestGeneratePaths(s.initConstants.CMPUseManifestGeneratePaths))
+		manifestGenResult, err = GenerateManifests(ctx, opContext.appPath, repoRoot, commitSHA, q, false, s.gitCredsStore, s.initConstants.MaxCombinedDirectoryManifestsSize, s.gitRepoPaths, WithCMPTarDoneChannel(ch.tarDoneCh), WithCMPTarExcludedGlobs(s.initConstants.CMPTarExcludedGlobs), WithCMPUseManifestGeneratePaths(s.initConstants.CMPUseManifestGeneratePaths), WithJsonnetReadSetCache(s.jsonnetReadSetCache))
 	}
 	refSourceCommitSHAs := make(map[string]string)
 	if len(repoRefs) > 0 {
@@ -1736,6 +1759,7 @@ type (
 		cmpTarDoneCh                chan<- bool
 		cmpTarExcludedGlobs         []string
 		cmpUseManifestGeneratePaths bool
+		jsonnetReadSetCache         *jsonnetReadSetCache
 	}
 )
 
@@ -1769,6 +1793,15 @@ func WithCMPTarExcludedGlobs(excludedGlobs []string) GenerateManifestOpt {
 func WithCMPUseManifestGeneratePaths(enabled bool) GenerateManifestOpt {
 	return func(o *generateManifestOpt) {
 		o.cmpUseManifestGeneratePaths = enabled
+	}
+}
+
+// WithJsonnetReadSetCache enables the optional native Jsonnet read-set cache
+// for the request. It only affects directories with a single native Jsonnet
+// entry; CMP/plugin renders and every other source type are unaffected.
+func WithJsonnetReadSetCache(c *jsonnetReadSetCache) GenerateManifestOpt {
+	return func(o *generateManifestOpt) {
+		o.jsonnetReadSetCache = c
 	}
 }
 
@@ -1836,7 +1869,10 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 			directory = &v1alpha1.ApplicationSourceDirectory{}
 		}
 		logCtx := log.WithField("application", q.AppName)
-		targetObjs, err = findManifests(logCtx, appPath, repoRoot, env, *directory, q.EnabledSourceTypes, maxCombinedManifestQuantity)
+		targetObjs, err = findManifests(logCtx, appPath, repoRoot, env, *directory, q.EnabledSourceTypes, maxCombinedManifestQuantity, findManifestsOptions{
+			readSetCache: opt.jsonnetReadSetCache,
+			request:      q,
+		})
 	}
 	if err != nil {
 		return nil, err
@@ -2030,14 +2066,41 @@ func isNullList(obj *unstructured.Unstructured) bool {
 
 var manifestFile = regexp.MustCompile(`^.*\.(yaml|yml|json|jsonnet)$`)
 
+// findManifestsOptions carries optional collaborators for findManifests.
+type findManifestsOptions struct {
+	// readSetCache enables the optional native Jsonnet read-set cache. It is
+	// only consulted for a directory whose sole potentially-valid manifest is
+	// a single native Jsonnet entry.
+	readSetCache *jsonnetReadSetCache
+	// request is the originating manifest request, used to bind the Jsonnet
+	// cache key to project permissions and request-scoped options.
+	request *apiclient.ManifestRequest
+}
+
 // findManifests looks at all yaml files in a directory and unmarshals them into a list of unstructured objects
-func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1alpha1.Env, directory v1alpha1.ApplicationSourceDirectory, enabledManifestGeneration map[string]bool, maxCombinedManifestQuantity resource.Quantity) ([]*unstructured.Unstructured, error) {
+func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1alpha1.Env, directory v1alpha1.ApplicationSourceDirectory, enabledManifestGeneration map[string]bool, maxCombinedManifestQuantity resource.Quantity, opts ...findManifestsOptions) ([]*unstructured.Unstructured, error) {
+	var opt findManifestsOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
 	// Validate the directory before loading any manifests to save memory.
 	potentiallyValidManifests, err := getPotentiallyValidManifests(logCtx, appPath, repoRoot, directory.Recurse, directory.DisableExtensionFilter, directory.Include, directory.Exclude, maxCombinedManifestQuantity)
 	if err != nil {
 		logCtx.Errorf("failed to get potentially valid manifests: %s", err)
 		return nil, fmt.Errorf("failed to get potentially valid manifests: %w", err)
 	}
+
+	// The read-set cache is only eligible for an explicit, single native
+	// Jsonnet entry: with exactly one potentially-valid manifest that is a
+	// .jsonnet file, every input of the render flows through the confined
+	// importer and can be recorded and re-proven. Directories with additional
+	// YAML/JSON manifests, multiple entries or CMP/plugin rendering are never
+	// cached here. A present but disabled cache still routes through this path
+	// and delegates to the ordinary VM evaluation unchanged.
+	singleNativeJsonnetEntry := opt.readSetCache != nil &&
+		len(potentiallyValidManifests) == 1 &&
+		strings.HasSuffix(potentiallyValidManifests[0].fileInfo.Name(), ".jsonnet")
 
 	var objs []*unstructured.Unstructured
 	for _, potentiallyValidManifest := range potentiallyValidManifests {
@@ -2048,11 +2111,16 @@ func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1al
 			if !discovery.IsManifestGenerationEnabled(v1alpha1.ApplicationSourceTypeDirectory, enabledManifestGeneration) {
 				continue
 			}
-			vm, err := makeJsonnetVM(appPath, repoRoot, directory.Jsonnet, env)
-			if err != nil {
-				return nil, err
+			var jsonStr string
+			if singleNativeJsonnetEntry {
+				jsonStr, err = opt.readSetCache.evaluateEntry(appPath, repoRoot, manifestPath, directory, env, opt.request)
+			} else {
+				var vm *jsonnet.VM
+				vm, err = makeJsonnetVM(appPath, repoRoot, directory.Jsonnet, env)
+				if err == nil {
+					jsonStr, err = vm.EvaluateFile(manifestPath)
+				}
 			}
-			jsonStr, err := vm.EvaluateFile(manifestPath)
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "Failed to evaluate jsonnet %q: %v", manifestFileInfo.Name(), err)
 			}
@@ -2307,27 +2375,27 @@ func getPotentiallyValidManifests(logCtx *log.Entry, appPath string, repoRoot st
 	return potentiallyValidManifests, nil
 }
 
-func makeJsonnetVM(appPath string, repoRoot string, sourceJsonnet v1alpha1.ApplicationSourceJsonnet, env *v1alpha1.Env) (*jsonnet.VM, error) {
-	vm := jsonnet.MakeVM()
-	for i, j := range sourceJsonnet.TLAs {
-		sourceJsonnet.TLAs[i].Value = env.Envsubst(j.Value)
+// resolvedJsonnetConfig holds the fully resolved, request-specific inputs of a
+// native Jsonnet VM: envsubst'ed top-level arguments and external variables,
+// and the ordered absolute library search paths.
+type resolvedJsonnetConfig struct {
+	extVars []v1alpha1.JsonnetVar
+	tlas    []v1alpha1.JsonnetVar
+	jpaths  []string
+}
+
+// resolveJsonnetConfig applies environment substitution to the Jsonnet
+// variables and resolves the configured library directories relative to the
+// repository root. The returned values are exactly what the VM receives, so
+// they are suitable as semantic cache-key inputs.
+func resolveJsonnetConfig(appPath string, repoRoot string, sourceJsonnet v1alpha1.ApplicationSourceJsonnet, env *v1alpha1.Env) (resolvedJsonnetConfig, error) {
+	tlas := slices.Clone(sourceJsonnet.TLAs)
+	for i, j := range tlas {
+		tlas[i].Value = env.Envsubst(j.Value)
 	}
-	for i, j := range sourceJsonnet.ExtVars {
-		sourceJsonnet.ExtVars[i].Value = env.Envsubst(j.Value)
-	}
-	for _, arg := range sourceJsonnet.TLAs {
-		if arg.Code {
-			vm.TLACode(arg.Name, arg.Value)
-		} else {
-			vm.TLAVar(arg.Name, arg.Value)
-		}
-	}
-	for _, extVar := range sourceJsonnet.ExtVars {
-		if extVar.Code {
-			vm.ExtCode(extVar.Name, extVar.Value)
-		} else {
-			vm.ExtVar(extVar.Name, extVar.Value)
-		}
+	extVars := slices.Clone(sourceJsonnet.ExtVars)
+	for i, j := range extVars {
+		extVars[i].Value = env.Envsubst(j.Value)
 	}
 
 	// Jsonnet Imports relative to the repository path
@@ -2336,17 +2404,46 @@ func makeJsonnetVM(appPath string, repoRoot string, sourceJsonnet v1alpha1.Appli
 		// the jsonnet library path is relative to the repository root, not application path
 		jpath, err := pathutil.ResolveFileOrDirectoryPath(repoRoot, repoRoot, p)
 		if err != nil {
-			return nil, err
+			return resolvedJsonnetConfig{}, err
 		}
 		jpaths = append(jpaths, string(jpath))
 	}
 
-	vm.Importer(&confinedImporter{
-		FileImporter: &jsonnet.FileImporter{JPaths: jpaths},
-		repoRoot:     repoRoot,
-	})
+	return resolvedJsonnetConfig{extVars: extVars, tlas: tlas, jpaths: jpaths}, nil
+}
 
-	return vm, nil
+// newJsonnetVM builds a native go-jsonnet VM from a resolved configuration.
+// The VM registers no native callbacks, so with a confined importer its only
+// possible I/O is repository file reads performed by the importer.
+func newJsonnetVM(cfg resolvedJsonnetConfig, importer jsonnet.Importer) *jsonnet.VM {
+	vm := jsonnet.MakeVM()
+	for _, arg := range cfg.tlas {
+		if arg.Code {
+			vm.TLACode(arg.Name, arg.Value)
+		} else {
+			vm.TLAVar(arg.Name, arg.Value)
+		}
+	}
+	for _, extVar := range cfg.extVars {
+		if extVar.Code {
+			vm.ExtCode(extVar.Name, extVar.Value)
+		} else {
+			vm.ExtVar(extVar.Name, extVar.Value)
+		}
+	}
+	vm.Importer(importer)
+	return vm
+}
+
+func makeJsonnetVM(appPath string, repoRoot string, sourceJsonnet v1alpha1.ApplicationSourceJsonnet, env *v1alpha1.Env) (*jsonnet.VM, error) {
+	cfg, err := resolveJsonnetConfig(appPath, repoRoot, sourceJsonnet, env)
+	if err != nil {
+		return nil, err
+	}
+	return newJsonnetVM(cfg, &confinedImporter{
+		FileImporter: &jsonnet.FileImporter{JPaths: cfg.jpaths},
+		repoRoot:     repoRoot,
+	}), nil
 }
 
 // confinedImporter wraps a jsonnet.FileImporter and rejects any import whose
@@ -2363,6 +2460,12 @@ func makeJsonnetVM(appPath string, repoRoot string, sourceJsonnet v1alpha1.Appli
 type confinedImporter struct {
 	*jsonnet.FileImporter
 	repoRoot string
+	// recorder, when set, collects the complete read-set of the evaluation:
+	// every candidate path probed in search order (including non-existent
+	// candidates that affect which location wins) and the identity of every
+	// blob successfully returned to the VM. It is observational only and never
+	// changes resolution or validation behaviour.
+	recorder *jsonnetReadSet
 }
 
 func (i *confinedImporter) Import(importedFrom, importedPath string) (jsonnet.Contents, string, error) {
@@ -2374,7 +2477,12 @@ func (i *confinedImporter) Import(importedFrom, importedPath string) (jsonnet.Co
 	if err := i.validate(foundAt, importedPath); err != nil {
 		return jsonnet.Contents{}, "", err
 	}
-	return i.FileImporter.Import(importedFrom, importedPath)
+	contents, foundAt, err := i.FileImporter.Import(importedFrom, importedPath)
+	if err != nil {
+		return jsonnet.Contents{}, "", err
+	}
+	i.recorder.recordRead(foundAt, contents)
+	return contents, foundAt, nil
 }
 
 // locate mirrors the candidate search order of go-jsonnet's own
@@ -2384,6 +2492,7 @@ func (i *confinedImporter) locate(dir, importedPath string) (string, error) {
 	if filepath.IsAbs(importedPath) {
 		if _, err := os.Lstat(importedPath); err != nil {
 			if os.IsNotExist(err) {
+				i.recorder.recordMissing(importedPath)
 				return "", fmt.Errorf("couldn't open import %q: no match locally or in the Jsonnet library paths", importedPath)
 			}
 			return "", err
@@ -2400,7 +2509,11 @@ func (i *confinedImporter) locate(dir, importedPath string) (string, error) {
 		absPath := filepath.Join(base, importedPath)
 		if _, err := os.Lstat(absPath); err == nil {
 			return absPath, nil
-		} else if !os.IsNotExist(err) {
+		} else if os.IsNotExist(err) {
+			// Record the negative fact: a later revision could create a file
+			// at this higher-priority candidate and change resolution.
+			i.recorder.recordMissing(absPath)
+		} else {
 			return "", err
 		}
 	}

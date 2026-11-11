@@ -86,6 +86,10 @@ func NewCommand() *cobra.Command {
 		gitLsRemoteOptimizedEnabled        bool
 		clientCAPath                       string
 		disableTLS                         bool
+		jsonnetReadSetCacheEnabled         bool
+		jsonnetReadSetMaxFiles             int
+		jsonnetReadSetMaxChecks            int
+		jsonnetReadSetMaxBytes             int64
 	)
 	command := cobra.Command{
 		Use:               common.CommandRepoServer,
@@ -169,6 +173,10 @@ func NewCommand() *cobra.Command {
 				GitLsRemoteOptimizedEnabled:                  gitLsRemoteOptimizedEnabled,
 				HelmUserAgent:                                helmUserAgent,
 				HelmChartCacheExpiration:                     repoCacheExpiration,
+				JsonnetReadSetCacheEnabled:                   jsonnetReadSetCacheEnabled,
+				JsonnetReadSetMaxFiles:                       jsonnetReadSetMaxFiles,
+				JsonnetReadSetMaxChecks:                      jsonnetReadSetMaxChecks,
+				JsonnetReadSetMaxBytes:                       jsonnetReadSetMaxBytes,
 			}, askPassServer, clientCAPath, disableTLS)
 			errors.CheckError(err)
 
@@ -292,6 +300,10 @@ func NewCommand() *cobra.Command {
 	command.Flags().StringSliceVar(&ociMediaTypes, "oci-layer-media-types", env.StringsFromEnv("ARGOCD_REPO_SERVER_OCI_LAYER_MEDIA_TYPES", []string{"application/vnd.oci.image.layer.v1.tar", "application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.cncf.helm.chart.content.v1.tar+gzip"}, ","), "Comma separated list of allowed media types for OCI media types. This only accounts for media types within layers.")
 	command.Flags().BoolVar(&enableBuiltinGitConfig, "enable-builtin-git-config", env.ParseBoolFromEnv("ARGOCD_REPO_SERVER_ENABLE_BUILTIN_GIT_CONFIG", true), "Enable builtin git configuration options that are required for correct argocd-repo-server operation.")
 	command.Flags().BoolVar(&gitLsRemoteOptimizedEnabled, "git-ls-remote-optimized", env.ParseBoolFromEnv("ARGOCD_GIT_LS_REMOTE_OPTIMIZED_ENABLED", false), "Enable native Git protocol v2 ref resolution with server-side HEAD, branch, and tag narrowing.")
+	command.Flags().BoolVar(&jsonnetReadSetCacheEnabled, "jsonnet-read-set-cache", env.ParseBoolFromEnv("ARGOCD_REPO_SERVER_JSONNET_READ_SET_CACHE", false), "Enable the native Jsonnet read-set cache, which reuses single-entry native Jsonnet renders across revisions when every read file and import-search fact is provably unchanged. CMP/plugin renders are not affected.")
+	command.Flags().IntVar(&jsonnetReadSetMaxFiles, "jsonnet-read-set-max-files", env.ParseNumFromEnv("ARGOCD_REPO_SERVER_JSONNET_READ_SET_MAX_FILES", 1000, 0, math.MaxInt32), "Maximum number of distinct files recorded in one cached Jsonnet render read-set. Renders exceeding the limit are served but not cached.")
+	command.Flags().IntVar(&jsonnetReadSetMaxChecks, "jsonnet-read-set-max-checks", env.ParseNumFromEnv("ARGOCD_REPO_SERVER_JSONNET_READ_SET_MAX_CHECKS", 4000, 0, math.MaxInt32), "Maximum number of non-existent import candidate paths recorded in one cached Jsonnet render read-set. Renders exceeding the limit are served but not cached.")
+	command.Flags().Int64Var(&jsonnetReadSetMaxBytes, "jsonnet-read-set-max-bytes", env.ParseInt64FromEnv("ARGOCD_REPO_SERVER_JSONNET_READ_SET_MAX_BYTES", 10*1024*1024, 0, math.MaxInt64), "Maximum total bytes of files recorded in one cached Jsonnet render read-set. Renders exceeding the limit are served but not cached.")
 	command.Flags().BoolVar(&disableTLS, "disable-tls", env.ParseBoolFromEnv("ARGOCD_REPO_SERVER_DISABLE_TLS", false), "Disable TLS for the repo-server gRPC endpoint")
 	command.Flags().StringVar(&clientCAPath, "client-ca-path", env.StringFromEnv("ARGOCD_REPO_SERVER_CLIENT_CA_PATH", "/app/config/reposerver/mtls/client-ca.crt"), "Path to the client CA certificate file for mTLS. Defaults to the auto-mounted Secret path; mTLS is skipped if the file does not exist.")
 
