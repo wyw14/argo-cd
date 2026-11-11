@@ -50,6 +50,7 @@ import (
 	"github.com/argoproj/argo-cd/v3/util/db"
 	"github.com/argoproj/argo-cd/v3/util/git"
 	utilio "github.com/argoproj/argo-cd/v3/util/io"
+	"github.com/argoproj/argo-cd/v3/util/provenance"
 	"github.com/argoproj/argo-cd/v3/util/settings"
 	"github.com/argoproj/argo-cd/v3/util/stats"
 	traceutil "github.com/argoproj/argo-cd/v3/util/trace"
@@ -320,6 +321,9 @@ func (m *appStateManager) GetRepoObjs(ctx context.Context, app *v1alpha1.Applica
 
 	manifestInfos := make([]*apiclient.ManifestResponse, 0)
 	targetObjs := make([]*unstructured.Unstructured, 0)
+	// Provenance is opt-in via the context. The recorder observes the real per-source render
+	// results below; it never influences the requests, cache identity or permission checks.
+	rec := provenance.RecorderFromContext(ctx)
 
 	// Store the map of all sources having ref field into a map for applications with sources field
 	// If it's for a rollback process, the refSources[*].targetRevision fields are the desired
@@ -429,6 +433,12 @@ func (m *appStateManager) GetRepoObjs(ctx context.Context, app *v1alpha1.Applica
 			targetObj, err := unmarshalManifests(manifestInfo.Manifests)
 			if err != nil {
 				return fmt.Errorf("failed to unmarshal manifests for source %d of %d: %w", i+1, len(sources), err)
+			}
+			if rec != nil {
+				// Bind redacted source identity (no credentials, no checkout roots) and align
+				// evidence with the exact bytes the repo-server returned, in output order.
+				identity := provenance.NewSourceIdentity(i, source.Name, source.RepoURL, manifestInfo.Revision, source.Path, manifestInfo.SourceType)
+				rec.RecordSourceOutput(identity, manifestInfo.Manifests, targetObj)
 			}
 			targetObjs = append(targetObjs, targetObj...)
 			manifestInfos = append(manifestInfos, manifestInfo)
@@ -572,7 +582,18 @@ func unmarshalManifests(manifests []string) ([]*unstructured.Unstructured, error
 }
 
 func NormalizeTargetObjects(namespace string, objs []*unstructured.Unstructured, infoProvider kubeutil.ResourceInfoProvider, setAppInstance func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, []v1alpha1.ApplicationCondition, error) {
+	return NormalizeTargetObjectsWithProvenance(namespace, objs, infoProvider, setAppInstance, nil, nil)
+}
+
+// NormalizeTargetObjectsWithProvenance is NormalizeTargetObjects with an optional provenance
+// recorder. When rec is nil the behavior is byte-for-byte identical to NormalizeTargetObjects:
+// the same objects are mutated, the same last-wins merge is applied and the same repeated
+// resource conditions are returned. The recorder only observes; it never changes ordering or
+// output. trackingPaths lists the field paths the setAppInstance callback may write so they can
+// be marked as tracking-derived evidence.
+func NormalizeTargetObjectsWithProvenance(namespace string, objs []*unstructured.Unstructured, infoProvider kubeutil.ResourceInfoProvider, setAppInstance func(*unstructured.Unstructured) error, rec *provenance.Recorder, trackingPaths []string) ([]*unstructured.Unstructured, []v1alpha1.ApplicationCondition, error) {
 	targetByKey := make(map[kubeutil.ResourceKey][]*unstructured.Unstructured)
+	indexByKey := make(map[kubeutil.ResourceKey][]int)
 	for i := range objs {
 		obj := objs[i]
 		if obj == nil {
@@ -596,6 +617,12 @@ func NormalizeTargetObjects(namespace string, objs []*unstructured.Unstructured,
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to set app instance label on resource %s/%s: %w", obj.GetKind(), obj.GetName(), err)
 			}
+			if rec != nil {
+				rec.RecordNormalizeDerived(i, "metadata.namespace", provenance.DerivedDefaultNamespace)
+				for _, fieldPath := range trackingPaths {
+					rec.RecordNormalizeDerived(i, fieldPath, provenance.DerivedTrackingMetadata)
+				}
+			}
 		}
 
 		key := kubeutil.GetResourceKey(obj)
@@ -603,6 +630,7 @@ func NormalizeTargetObjects(namespace string, objs []*unstructured.Unstructured,
 			key.Name = fmt.Sprintf("%s%d", obj.GetGenerateName(), i)
 		}
 		targetByKey[key] = append(targetByKey[key], obj)
+		indexByKey[key] = append(indexByKey[key], i)
 	}
 
 	conditions := make([]v1alpha1.ApplicationCondition, 0)
@@ -611,11 +639,21 @@ func NormalizeTargetObjects(namespace string, objs []*unstructured.Unstructured,
 		if len(targets) > 1 {
 			// If an object is duplicated in the target, we add a condition to the application.
 			now := metav1.Now()
+			message := fmt.Sprintf("Resource %s appeared %d times among application resources.", key.String(), len(targets))
 			conditions = append(conditions, v1alpha1.ApplicationCondition{
 				Type:               v1alpha1.ApplicationConditionRepeatedResourceWarning,
-				Message:            fmt.Sprintf("Resource %s appeared %d times among application resources.", key.String(), len(targets)),
+				Message:            message,
 				LastTransitionTime: &now,
 			})
+			if rec != nil {
+				// Whole-object override: the last source wins. Overridden objects are recorded as
+				// separate Overridden nodes; their fields are never copied onto the winner, so an
+				// override can never be presented as merged inheritance.
+				indexes := indexByKey[key]
+				winnerIndex := indexes[len(indexes)-1]
+				rec.RecordIdentityOverride(winnerIndex, indexes[:len(indexes)-1], key.String())
+				rec.AddWarning(message)
+			}
 		}
 		// Only keep the last target object to avoid duplicate resources.
 		result = append(result, targets[len(targets)-1])
@@ -793,9 +831,16 @@ func (m *appStateManager) CompareAppState(ctx context.Context, app *v1alpha1.App
 		infoProvider = &resourceInfoProviderStub{}
 	}
 
-	targetObjs, dedupConditions, err := NormalizeTargetObjects(app.Spec.Destination.Namespace, targetObjs, infoProvider, func(u *unstructured.Unstructured) error {
+	setAppInstance := func(u *unstructured.Unstructured) error {
 		return m.resourceTracking.SetAppInstance(u, appLabelKey, app.InstanceName(m.namespace), app.Spec.Destination.Namespace, v1alpha1.TrackingMethod(trackingMethod), installationID)
-	})
+	}
+	var dedupConditions []v1alpha1.ApplicationCondition
+	if rec := provenance.RecorderFromContext(ctx); rec != nil {
+		trackingPaths := provenance.TrackingFieldPaths(v1alpha1.TrackingMethod(trackingMethod), appLabelKey, installationID)
+		targetObjs, dedupConditions, err = NormalizeTargetObjectsWithProvenance(app.Spec.Destination.Namespace, targetObjs, infoProvider, setAppInstance, rec, trackingPaths)
+	} else {
+		targetObjs, dedupConditions, err = NormalizeTargetObjects(app.Spec.Destination.Namespace, targetObjs, infoProvider, setAppInstance)
+	}
 	if err != nil {
 		msg := "Failed to normalize target state: " + err.Error()
 		conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: msg, LastTransitionTime: &now})

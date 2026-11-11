@@ -71,6 +71,7 @@ import (
 	pathutil "github.com/argoproj/argo-cd/v3/util/io/path"
 	"github.com/argoproj/argo-cd/v3/util/kustomize"
 	"github.com/argoproj/argo-cd/v3/util/manifeststream"
+	"github.com/argoproj/argo-cd/v3/util/provenance"
 	"github.com/argoproj/argo-cd/v3/util/settings"
 	traceutil "github.com/argoproj/argo-cd/v3/util/trace"
 	"github.com/argoproj/argo-cd/v3/util/versions"
@@ -691,8 +692,11 @@ func (s *Service) GenerateManifest(ctx context.Context, q *apiclient.ManifestReq
 		return res, err
 	}
 
+	// Provenance collection is opt-in via the request context and never participates in the
+	// cache key or permission checks.
+	rec := provenance.RecorderFromContext(ctx)
 	cacheFn := func(revision string, refSourceCommitSHAs cache.ResolvedRevisions, firstInvocation bool) (bool, error) {
-		ok, resp, err := s.getManifestCacheEntry(revision, q, refSourceCommitSHAs, firstInvocation)
+		ok, resp, err := s.getManifestCacheEntry(revision, q, refSourceCommitSHAs, firstInvocation, rec)
 		res = resp
 		return ok, err
 	}
@@ -1062,6 +1066,12 @@ func (s *Service) runManifestGenAsync(ctx context.Context, repoRoot, commitSHA, 
 	manifestGenResult.SourceIntegrityResult = opContext.sourceIntegrityResult
 	// TODO: Remove deprecated https://github.com/argoproj/argo-cd/issues/27695
 	manifestGenResult.VerifyResult = opContext.verificationResult // nolint:staticcheck
+	// Attach the provenance artifact only when collection was requested. The manifest cache key
+	// is unchanged, so enabling the graph never changes cache identity.
+	if rec := provenance.RecorderFromContext(ctx); rec != nil {
+		manifestGenCacheEntry.ProvenanceGraph = rec.Graph()
+		manifestGenCacheEntry.ProvenanceArtifactVersion = provenance.ArtifactVersion
+	}
 	err = s.cache.SetManifests(manifestKey, &manifestGenCacheEntry)
 	if err != nil {
 		log.Warnf("manifest cache set error %s/%s: %v", appSourceCopy.String(), revision, err)
@@ -1075,7 +1085,7 @@ func (s *Service) runManifestGenAsync(ctx context.Context, repoRoot, commitSHA, 
 // - If the cache is not empty, but the cache value is an error AND that generation error has expired
 // and returns true otherwise.
 // If true is returned, either the second or third parameter (but not both) will contain a value from the cache (a ManifestResponse, or error, respectively)
-func (s *Service) getManifestCacheEntry(revision string, q *apiclient.ManifestRequest, refSourceCommitSHAs cache.ResolvedRevisions, firstInvocation bool) (bool, *apiclient.ManifestResponse, error) {
+func (s *Service) getManifestCacheEntry(revision string, q *apiclient.ManifestRequest, refSourceCommitSHAs cache.ResolvedRevisions, firstInvocation bool, rec *provenance.Recorder) (bool, *apiclient.ManifestResponse, error) {
 	cacheKey := cache.NewManifestKey(revision, q.ApplicationSource, q.GetRefSources(), q.GetNamespace(), q.GetTrackingMethod(),
 		q.GetAppLabelKey(), q.GetAppName(), q.GetInstallationID(), q.GetSourceIntegrity(), q, refSourceCommitSHAs,
 	)
@@ -1156,6 +1166,16 @@ func (s *Service) getManifestCacheEntry(revision string, q *apiclient.ManifestRe
 		}
 
 		logCtx.Info("manifest cache hit")
+		// A cached provenance artifact is only reused when it was produced by the current
+		// artifact version. Otherwise the recorder explicitly reports Unavailable instead of
+		// presenting stale evidence as authoritative.
+		if rec != nil {
+			if res.ProvenanceGraph != nil && res.ProvenanceArtifactVersion == provenance.ArtifactVersion {
+				rec.ImportCachedGraph(res.ProvenanceGraph)
+			} else {
+				rec.MarkUnavailable("manifest cache hit has no provenance artifact matching the current artifact version")
+			}
+		}
 		return true, res.ManifestResponse, nil
 	}
 
@@ -1780,6 +1800,13 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 	opt := newGenerateManifestOpt(opts...)
 	var targetObjs []*unstructured.Unstructured
 
+	// Provenance is opt-in via the context: a nil recorder leaves the whole pipeline unchanged.
+	rec := provenance.RecorderFromContext(ctx)
+	sourceIndex := 0
+	if rec != nil {
+		sourceIndex = rec.SourceIndex()
+	}
+
 	resourceTracking := argo.NewResourceTracking()
 
 	env := newEnv(q, revision)
@@ -1792,6 +1819,9 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 	repoURL := ""
 	if q.Repo != nil {
 		repoURL = q.Repo.Repo
+	}
+	if rec != nil {
+		rec.BindRenderedSource(sourceIndex, repoURL, revision, q.ApplicationSource.Path, string(appSourceType))
 	}
 
 	var commands []string
@@ -1836,10 +1866,21 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 			directory = &v1alpha1.ApplicationSourceDirectory{}
 		}
 		logCtx := log.WithField("application", q.AppName)
-		targetObjs, err = findManifests(logCtx, appPath, repoRoot, env, *directory, q.EnabledSourceTypes, maxCombinedManifestQuantity)
+		targetObjs, err = findManifests(logCtx, appPath, repoRoot, env, *directory, q.EnabledSourceTypes, maxCombinedManifestQuantity, rec, sourceIndex)
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	// Renderers that cannot map their output back to concrete input fields are recorded as
+	// opaque. Argo CD never infers template line numbers from identical-looking text.
+	if rec != nil && appSourceType != v1alpha1.ApplicationSourceTypeDirectory {
+		for _, obj := range targetObjs {
+			if obj == nil {
+				continue
+			}
+			rec.RecordOpaqueObject(sourceIndex, obj, string(appSourceType))
+		}
 	}
 
 	manifests := make([]string, 0)
@@ -1862,6 +1903,12 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 			if err != nil {
 				return nil, err
 			}
+			if rec != nil {
+				for _, target := range targets {
+					// List expansion is an Argo CD transformation and must be explicit.
+					rec.RecordListExpansion(sourceIndex, obj, target)
+				}
+			}
 		case isNullList(obj):
 			// noop
 		default:
@@ -1874,12 +1921,18 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 				if err != nil {
 					return nil, fmt.Errorf("failed to set app instance tracking info on manifest: %w", err)
 				}
+				if rec != nil {
+					recordTrackingProvenance(rec, target, q)
+				}
 			}
 			manifestStr, err := json.Marshal(target.Object)
 			if err != nil {
 				return nil, err
 			}
 			manifests = append(manifests, string(manifestStr))
+			if rec != nil {
+				rec.RecordOutputManifest(target, manifestStr)
+			}
 		}
 	}
 
@@ -1888,6 +1941,14 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 		SourceType: string(appSourceType),
 		Commands:   commands,
 	}, nil
+}
+
+// recordTrackingProvenance marks the exact tracking label/annotation fields as derived instead
+// of letting them look like verbatim input values.
+func recordTrackingProvenance(rec *provenance.Recorder, target *unstructured.Unstructured, q *apiclient.ManifestRequest) {
+	for _, fieldPath := range provenance.TrackingFieldPaths(v1alpha1.TrackingMethod(q.TrackingMethod), q.AppLabelKey, q.InstallationID) {
+		rec.RecordDerivedField(target, fieldPath, provenance.DerivedTrackingMetadata)
+	}
 }
 
 func newEnv(q *apiclient.ManifestRequest, revision string) *v1alpha1.Env {
@@ -2030,8 +2091,11 @@ func isNullList(obj *unstructured.Unstructured) bool {
 
 var manifestFile = regexp.MustCompile(`^.*\.(yaml|yml|json|jsonnet)$`)
 
-// findManifests looks at all yaml files in a directory and unmarshals them into a list of unstructured objects
-func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1alpha1.Env, directory v1alpha1.ApplicationSourceDirectory, enabledManifestGeneration map[string]bool, maxCombinedManifestQuantity resource.Quantity) ([]*unstructured.Unstructured, error) {
+// findManifests looks at all yaml files in a directory and unmarshals them into a list of
+// unstructured objects. The optional provenance recorder is nil-safe: when nil, rendering is
+// unchanged. Native YAML/JSON documents get field-level evidence; Jsonnet output is opaque
+// because its evaluated objects cannot be mapped back to specific template lines.
+func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1alpha1.Env, directory v1alpha1.ApplicationSourceDirectory, enabledManifestGeneration map[string]bool, maxCombinedManifestQuantity resource.Quantity, rec *provenance.Recorder, sourceIndex int) ([]*unstructured.Unstructured, error) {
 	// Validate the directory before loading any manifests to save memory.
 	potentiallyValidManifests, err := getPotentiallyValidManifests(logCtx, appPath, repoRoot, directory.Recurse, directory.DisableExtensionFilter, directory.Include, directory.Exclude, maxCombinedManifestQuantity)
 	if err != nil {
@@ -2058,9 +2122,11 @@ func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1al
 			}
 
 			// attempt to unmarshal either array or single object
+			var generatedObjs []*unstructured.Unstructured
 			var jsonObjs []*unstructured.Unstructured
 			err = json.Unmarshal([]byte(jsonStr), &jsonObjs)
 			if err == nil {
+				generatedObjs = jsonObjs
 				objs = append(objs, jsonObjs...)
 			} else {
 				var jsonObj unstructured.Unstructured
@@ -2068,10 +2134,18 @@ func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1al
 				if err != nil {
 					return nil, status.Errorf(codes.FailedPrecondition, "Failed to unmarshal generated json %q: %v", manifestFileInfo.Name(), err)
 				}
+				generatedObjs = []*unstructured.Unstructured{&jsonObj}
 				objs = append(objs, &jsonObj)
 			}
+			// Jsonnet evaluation produces new objects; field-to-template mapping is unavailable,
+			// so record them as opaque rather than guessing origins from identical text.
+			if rec != nil {
+				for _, jsonObj := range generatedObjs {
+					rec.RecordOpaqueObject(sourceIndex, jsonObj, string(v1alpha1.ApplicationSourceTypeDirectory)+"/Jsonnet")
+				}
+			}
 		} else {
-			err := getObjsFromYAMLOrJSON(logCtx, manifestPath, manifestFileInfo.Name(), &objs)
+			err := getObjsFromYAMLOrJSON(logCtx, manifestPath, manifestFileInfo.Name(), repoRoot, &objs, rec, sourceIndex)
 			if err != nil {
 				return nil, err
 			}
@@ -2080,8 +2154,11 @@ func findManifests(logCtx *log.Entry, appPath string, repoRoot string, env *v1al
 	return objs, nil
 }
 
-// getObjsFromYAMLOrJSON unmarshals the given yaml or json file and appends it to the given list of objects.
-func getObjsFromYAMLOrJSON(logCtx *log.Entry, manifestPath string, filename string, objs *[]*unstructured.Unstructured) error {
+// getObjsFromYAMLOrJSON unmarshals the given yaml or json file and appends it to the given list
+// of objects. The optional provenance recorder registers every decoded object against an input
+// document reference built from the repository-relative path and document index; when nil, the
+// behavior is unchanged.
+func getObjsFromYAMLOrJSON(logCtx *log.Entry, manifestPath string, filename string, repoRoot string, objs *[]*unstructured.Unstructured, rec *provenance.Recorder, sourceIndex int) error {
 	reader, err := utfutil.OpenFile(manifestPath, utfutil.UTF8)
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "Failed to open %q", manifestPath)
@@ -2094,6 +2171,8 @@ func getObjsFromYAMLOrJSON(logCtx *log.Entry, manifestPath string, filename stri
 		}
 	}
 	defer closeReader(reader)
+	// relPath is repository-relative so the temporary checkout root never reaches the graph.
+	relPath := provenanceRelativePath(repoRoot, manifestPath)
 	if strings.HasSuffix(filename, ".json") {
 		var obj unstructured.Unstructured
 		decoder := json.NewDecoder(reader)
@@ -2116,9 +2195,20 @@ func getObjsFromYAMLOrJSON(logCtx *log.Entry, manifestPath string, filename stri
 		if decoder.More() {
 			return status.Errorf(codes.FailedPrecondition, "Found multiple objects in %q. Only single objects are allowed in JSON files.", filename)
 		}
+		if rec != nil {
+			docID := rec.RecordInputDocument(sourceIndex, relPath, 0, nil)
+			rec.RecordDirectoryObject(sourceIndex, &obj, docID)
+		}
 		*objs = append(*objs, &obj)
 	} else {
-		yamlObjs, err := splitYAMLOrJSON(reader)
+		var yamlObjs []*unstructured.Unstructured
+		yamlObjs, err = splitYAMLOrJSON(reader, func(docIndex int, u *unstructured.Unstructured) {
+			if rec == nil {
+				return
+			}
+			docID := rec.RecordInputDocument(sourceIndex, relPath, docIndex, nil)
+			rec.RecordDirectoryObject(sourceIndex, u, docID)
+		})
 		if err != nil {
 			if len(yamlObjs) > 0 {
 				// If we get here, we had a multiple objects in a single YAML file which had some
@@ -2144,11 +2234,28 @@ func getObjsFromYAMLOrJSON(logCtx *log.Entry, manifestPath string, filename stri
 	return nil
 }
 
-// splitYAMLOrJSON reads a YAML or JSON file and gets each document as an unstructured object. If the unmarshaller
-// encounters an error, objects read up until the error are returned.
-func splitYAMLOrJSON(reader goio.Reader) ([]*unstructured.Unstructured, error) {
+// provenanceRelativePath converts an absolute manifest path into a repository-relative path for
+// provenance purposes. When the relative computation fails, only the base name is used so an
+// absolute temporary checkout path can never be recorded.
+func provenanceRelativePath(repoRoot, manifestPath string) string {
+	if repoRoot == "" {
+		return filepath.Base(manifestPath)
+	}
+	rel, err := filepath.Rel(repoRoot, manifestPath)
+	if err != nil {
+		return filepath.Base(manifestPath)
+	}
+	return filepath.ToSlash(rel)
+}
+
+// splitYAMLOrJSON reads a YAML or JSON file and gets each document as an unstructured object.
+// The optional observe callback is invoked for every decoded document together with its
+// zero-based document index. If the unmarshaller encounters an error, objects read up until the
+// error are returned.
+func splitYAMLOrJSON(reader goio.Reader, observe func(docIndex int, obj *unstructured.Unstructured)) ([]*unstructured.Unstructured, error) {
 	d := kubeyaml.NewYAMLOrJSONDecoder(reader, 4096)
 	var objs []*unstructured.Unstructured
+	docIndex := 0
 	for {
 		u := &unstructured.Unstructured{}
 		if err := d.Decode(&u); err != nil {
@@ -2158,8 +2265,13 @@ func splitYAMLOrJSON(reader goio.Reader) ([]*unstructured.Unstructured, error) {
 			return objs, fmt.Errorf("failed to unmarshal manifest: %w", err)
 		}
 		if u == nil {
+			docIndex++
 			continue
 		}
+		if observe != nil {
+			observe(docIndex, u)
+		}
+		docIndex++
 		objs = append(objs, u)
 	}
 	return objs, nil

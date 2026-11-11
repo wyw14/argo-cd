@@ -22,6 +22,7 @@ import (
 	"github.com/argoproj/argo-cd/v3/util/env"
 	"github.com/argoproj/argo-cd/v3/util/git"
 	"github.com/argoproj/argo-cd/v3/util/hash"
+	"github.com/argoproj/argo-cd/v3/util/provenance"
 )
 
 var (
@@ -60,6 +61,13 @@ type CachedManifestResponse struct {
 	FirstFailureTimestamp           int64                       `json:"firstFailureTimestamp"`
 	NumberOfConsecutiveFailures     int                         `json:"numberOfConsecutiveFailures"`
 	NumberOfCachedResponsesReturned int                         `json:"numberOfCachedResponsesReturned"`
+	// ProvenanceGraph is the optional manifest provenance artifact. It is only populated when
+	// rendering was requested with a provenance recorder; it rides the existing cache entry and
+	// never changes the manifest cache key.
+	ProvenanceGraph *provenance.ManifestProvenanceGraph `json:"provenanceGraph,omitempty"`
+	// ProvenanceArtifactVersion is the artifact version of ProvenanceGraph at generation time.
+	// A cached graph is only reused when this matches the current artifact version.
+	ProvenanceArtifactVersion string `json:"provenanceArtifactVersion,omitempty"`
 }
 
 func NewCache(cache *cacheutil.Cache, repoCacheExpiration time.Duration, revisionCacheExpiration time.Duration, revisionCacheLockTimeout time.Duration) *Cache {
@@ -624,6 +632,8 @@ func (cmr *CachedManifestResponse) shallowCopy() *CachedManifestResponse {
 		MostRecentError:                 cmr.MostRecentError,
 		NumberOfCachedResponsesReturned: cmr.NumberOfCachedResponsesReturned,
 		NumberOfConsecutiveFailures:     cmr.NumberOfConsecutiveFailures,
+		ProvenanceGraph:                 cmr.ProvenanceGraph,
+		ProvenanceArtifactVersion:       cmr.ProvenanceArtifactVersion,
 	}
 }
 
